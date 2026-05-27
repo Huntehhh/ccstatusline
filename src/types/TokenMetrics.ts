@@ -5,12 +5,20 @@ export interface TokenUsage {
     cache_read_input_tokens?: number;
 }
 
+export interface CompactMetadata {
+    trigger?: string;
+    preTokens?: number;
+    postTokens?: number;
+}
+
 export interface TranscriptLine {
     message?: { usage?: TokenUsage; stop_reason?: string | null };
     isSidechain?: boolean;
     timestamp?: string;
     isApiErrorMessage?: boolean;
     type?: 'user' | 'assistant' | 'system' | 'progress' | 'file-history-snapshot';
+    subtype?: string;
+    compactMetadata?: CompactMetadata;
 }
 
 export interface TokenMetrics {

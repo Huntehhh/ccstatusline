@@ -170,15 +170,45 @@ export async function getTokenMetrics(transcriptPath: string): Promise<TokenMetr
         // live updates do not overcount duplicate partial rows. If the transcript
         // format has no stop_reason field at all, fall back to counting all entries.
         let mostRecentMainChainEntry: TranscriptLine | null = null;
+        let mostRecentMainChainLineIndex = -1;
         let mostRecentTimestamp: Date | null = null;
 
-        const parsedEntries: TranscriptLine[] = [];
+        // Track the most recent /compact boundary so the reported context length
+        // reflects the post-compaction window instead of the stale pre-compaction
+        // peak. Claude Code writes a marker entry of the shape
+        // { type: 'system', subtype: 'compact_boundary',
+        //   compactMetadata: { preTokens, postTokens } } that carries no usage
+        // block, so the most-recent-with-usage scan below would otherwise still
+        // resolve to the last pre-compaction assistant turn during the gap
+        // between the marker and the first new model response.
+        let lastCompactBoundaryLineIndex = -1;
+        let lastCompactPostTokens: number | null = null;
+
+        const parsedEntries: { data: TranscriptLine; lineIndex: number }[] = [];
         let hasStopReasonField = false;
 
-        for (const line of lines) {
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+            const line = lines[lineIndex];
+            if (!line) {
+                continue;
+            }
+
             const data = parseJsonlLine(line) as TranscriptLine | null;
-            if (data?.message?.usage) {
-                parsedEntries.push(data);
+            if (!data) {
+                continue;
+            }
+
+            if (data.type === 'system' && data.subtype === 'compact_boundary') {
+                lastCompactBoundaryLineIndex = lineIndex;
+                const postTokens = data.compactMetadata?.postTokens;
+                lastCompactPostTokens = typeof postTokens === 'number' && Number.isFinite(postTokens) && postTokens >= 0
+                    ? postTokens
+                    : null;
+                continue;
+            }
+
+            if (data.message?.usage) {
+                parsedEntries.push({ data, lineIndex });
                 if (Object.hasOwn(data.message, 'stop_reason')) {
                     hasStopReasonField = true;
                 }
@@ -186,13 +216,13 @@ export async function getTokenMetrics(transcriptPath: string): Promise<TokenMetr
         }
 
         const entriesToCount = hasStopReasonField
-            ? parsedEntries.filter((data, index) => {
-                const stopReason = data.message?.stop_reason;
+            ? parsedEntries.filter((entry, index) => {
+                const stopReason = entry.data.message?.stop_reason;
                 return Boolean(stopReason) || (stopReason === null && index === parsedEntries.length - 1);
             })
             : parsedEntries;
 
-        for (const data of entriesToCount) {
+        for (const { data, lineIndex } of entriesToCount) {
             const usage = data.message?.usage;
             if (!usage) {
                 continue;
@@ -210,6 +240,7 @@ export async function getTokenMetrics(transcriptPath: string): Promise<TokenMetr
                 if (!mostRecentTimestamp || entryTime > mostRecentTimestamp) {
                     mostRecentTimestamp = entryTime;
                     mostRecentMainChainEntry = data;
+                    mostRecentMainChainLineIndex = lineIndex;
                 }
             }
         }
@@ -220,6 +251,19 @@ export async function getTokenMetrics(transcriptPath: string): Promise<TokenMetr
             contextLength = (usage.input_tokens || 0)
                 + (usage.cache_read_input_tokens ?? 0)
                 + (usage.cache_creation_input_tokens ?? 0);
+        }
+
+        // Compaction-aware override. When the conversation has been compacted but
+        // no fresh usage block has been written since the boundary yet, the value
+        // computed above is the stale pre-compaction peak. File position (not
+        // timestamp) decides "after the boundary": Claude Code re-injects the
+        // pre-compaction summary as user/attachment entries that can carry earlier
+        // timestamps than the boundary itself, so timestamp ordering is unreliable
+        // across a compaction. If the freshest usage entry sits before the latest
+        // boundary, prefer the boundary's recorded post-compaction size, falling
+        // back to 0 rather than reporting the inflated peak.
+        if (lastCompactBoundaryLineIndex >= 0 && mostRecentMainChainLineIndex < lastCompactBoundaryLineIndex) {
+            contextLength = lastCompactPostTokens ?? 0;
         }
 
         const totalTokens = inputTokens + outputTokens + cachedTokens;

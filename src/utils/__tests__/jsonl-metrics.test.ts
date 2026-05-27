@@ -41,6 +41,26 @@ function makeUsageLine(params: {
     });
 }
 
+function makeCompactBoundaryLine(params: {
+    timestamp: string;
+    preTokens?: number;
+    postTokens?: number;
+    trigger?: string;
+}): string {
+    return JSON.stringify({
+        timestamp: params.timestamp,
+        type: 'system',
+        subtype: 'compact_boundary',
+        content: 'Conversation compacted',
+        isSidechain: false,
+        compactMetadata: {
+            trigger: params.trigger ?? 'manual',
+            preTokens: params.preTokens,
+            postTokens: params.postTokens
+        }
+    });
+}
+
 function makeTranscriptLine(params: {
     timestamp: string;
     type: 'user' | 'assistant';
@@ -360,6 +380,206 @@ describe('jsonl transcript metrics', () => {
             totalTokens: 510,
             contextLength: 250
         });
+    });
+
+    it('reports the post-compaction window size during the gap after a /compact', async () => {
+        // Mirrors a real transcript: a large pre-compaction assistant turn, the
+        // compact_boundary marker (with postTokens), then the re-injected summary
+        // as a user entry that carries no usage block. In this window the only
+        // entry with usage is the pre-compaction peak, so without the fix the
+        // context length would report the stale ~750k peak instead of ~18k.
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccstatusline-jsonl-metrics-'));
+        tempRoots.push(root);
+        const transcriptPath = path.join(root, 'compaction-gap.jsonl');
+
+        fs.writeFileSync(transcriptPath, [
+            makeUsageLine({
+                timestamp: '2026-01-01T10:00:00.000Z',
+                input: 2,
+                output: 500,
+                cacheRead: 747226,
+                cacheCreate: 3317,
+                stopReason: 'end_turn'
+            }),
+            makeCompactBoundaryLine({
+                timestamp: '2026-01-01T10:05:00.000Z',
+                preTokens: 755033,
+                postTokens: 18236
+            }),
+            // Re-injected compaction summary: user entry, no usage block.
+            JSON.stringify({
+                timestamp: '2026-01-01T10:05:00.100Z',
+                type: 'user',
+                isCompactSummary: true,
+                isSidechain: false,
+                message: { role: 'user', content: 'This session is being continued...' }
+            })
+        ].join('\n'));
+
+        const metrics = await getTokenMetrics(transcriptPath);
+
+        // Cumulative totals are unchanged (still reflect the pre-compaction turn).
+        expect(metrics.inputTokens).toBe(2);
+        expect(metrics.outputTokens).toBe(500);
+        expect(metrics.cachedTokens).toBe(750543);
+        expect(metrics.totalTokens).toBe(751045);
+        // Context length reflects the post-compaction window, not the 750545 peak.
+        expect(metrics.contextLength).toBe(18236);
+    });
+
+    it('uses the fresh usage block once a model response arrives after compaction', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccstatusline-jsonl-metrics-'));
+        tempRoots.push(root);
+        const transcriptPath = path.join(root, 'compaction-recovered.jsonl');
+
+        fs.writeFileSync(transcriptPath, [
+            makeUsageLine({
+                timestamp: '2026-01-01T10:00:00.000Z',
+                input: 2,
+                output: 500,
+                cacheRead: 747226,
+                cacheCreate: 3317,
+                stopReason: 'end_turn'
+            }),
+            makeCompactBoundaryLine({
+                timestamp: '2026-01-01T10:05:00.000Z',
+                preTokens: 755033,
+                postTokens: 18236
+            }),
+            JSON.stringify({
+                timestamp: '2026-01-01T10:05:00.100Z',
+                type: 'user',
+                isCompactSummary: true,
+                isSidechain: false,
+                message: { role: 'user', content: 'This session is being continued...' }
+            }),
+            // First post-compaction model response: real usage block.
+            makeUsageLine({
+                timestamp: '2026-01-01T10:05:25.000Z',
+                input: 23348,
+                output: 400,
+                cacheRead: 13366,
+                cacheCreate: 50889,
+                stopReason: 'end_turn'
+            })
+        ].join('\n'));
+
+        const metrics = await getTokenMetrics(transcriptPath);
+
+        // Post-compaction response wins: 23348 + 13366 + 50889 = 87603.
+        expect(metrics.contextLength).toBe(87603);
+    });
+
+    it('prefers a post-compaction usage block even when it carries an earlier timestamp than the boundary', async () => {
+        // Claude Code re-injects pre-compaction summary entries that can have
+        // earlier timestamps than the boundary itself, so file position - not
+        // timestamp - must decide what counts as post-compaction.
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccstatusline-jsonl-metrics-'));
+        tempRoots.push(root);
+        const transcriptPath = path.join(root, 'compaction-clock-skew.jsonl');
+
+        fs.writeFileSync(transcriptPath, [
+            makeUsageLine({
+                timestamp: '2026-01-01T10:00:00.000Z',
+                input: 2,
+                output: 500,
+                cacheRead: 700000,
+                cacheCreate: 0,
+                stopReason: 'end_turn'
+            }),
+            makeCompactBoundaryLine({
+                timestamp: '2026-01-01T10:05:00.000Z',
+                preTokens: 700502,
+                postTokens: 18000
+            }),
+            // Post-boundary usage entry, but timestamped BEFORE the boundary.
+            makeUsageLine({
+                timestamp: '2026-01-01T10:04:30.000Z',
+                input: 9000,
+                output: 100,
+                cacheRead: 2000,
+                cacheCreate: 1000,
+                stopReason: 'end_turn'
+            })
+        ].join('\n'));
+
+        const metrics = await getTokenMetrics(transcriptPath);
+
+        // File position wins: the post-boundary entry (9000 + 2000 + 1000 = 12000)
+        // is used even though its timestamp predates the boundary.
+        expect(metrics.contextLength).toBe(12000);
+    });
+
+    it('falls back to zero context length when the boundary records no postTokens', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccstatusline-jsonl-metrics-'));
+        tempRoots.push(root);
+        const transcriptPath = path.join(root, 'compaction-no-posttokens.jsonl');
+
+        fs.writeFileSync(transcriptPath, [
+            makeUsageLine({
+                timestamp: '2026-01-01T10:00:00.000Z',
+                input: 2,
+                output: 500,
+                cacheRead: 600000,
+                cacheCreate: 0,
+                stopReason: 'end_turn'
+            }),
+            makeCompactBoundaryLine({
+                timestamp: '2026-01-01T10:05:00.000Z',
+                preTokens: 600502
+                // postTokens intentionally omitted
+            })
+        ].join('\n'));
+
+        const metrics = await getTokenMetrics(transcriptPath);
+
+        // No usable post-compaction size on the marker -> report 0 rather than
+        // the stale 600002 peak. Cumulative totals stay intact.
+        expect(metrics.contextLength).toBe(0);
+        expect(metrics.cachedTokens).toBe(600000);
+        expect(metrics.totalTokens).toBe(600502);
+    });
+
+    it('only resets relative to the most recent of multiple compaction boundaries', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccstatusline-jsonl-metrics-'));
+        tempRoots.push(root);
+        const transcriptPath = path.join(root, 'compaction-multiple.jsonl');
+
+        fs.writeFileSync(transcriptPath, [
+            makeUsageLine({
+                timestamp: '2026-01-01T10:00:00.000Z',
+                input: 2,
+                output: 100,
+                cacheRead: 400000,
+                cacheCreate: 0,
+                stopReason: 'end_turn'
+            }),
+            makeCompactBoundaryLine({
+                timestamp: '2026-01-01T10:05:00.000Z',
+                preTokens: 400102,
+                postTokens: 12000
+            }),
+            // Recovered after first compaction.
+            makeUsageLine({
+                timestamp: '2026-01-01T10:06:00.000Z',
+                input: 30000,
+                output: 200,
+                cacheRead: 500000,
+                cacheCreate: 0,
+                stopReason: 'end_turn'
+            }),
+            // Second compaction, no fresh response yet -> gap again.
+            makeCompactBoundaryLine({
+                timestamp: '2026-01-01T10:30:00.000Z',
+                preTokens: 530200,
+                postTokens: 20500
+            })
+        ].join('\n'));
+
+        const metrics = await getTokenMetrics(transcriptPath);
+
+        // Latest boundary governs: report its postTokens, not the recovered peak.
+        expect(metrics.contextLength).toBe(20500);
     });
 
     it('returns zeroed token metrics when file is missing', async () => {
