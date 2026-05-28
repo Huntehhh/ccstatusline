@@ -19,6 +19,7 @@ import {
     getPowerlineTheme
 } from './colors';
 import { calculateContextPercentage } from './context-percentage';
+import { isWidgetHiddenByEnv } from './segment-toggles';
 import { getTerminalWidth } from './terminal';
 import { getWidget } from './widgets';
 
@@ -512,6 +513,21 @@ export function preRenderAllWidgets(
             const widgetImpl = getWidget(widget.type);
             if (!widgetImpl) {
                 // Unknown widget type - skip it entirely
+                continue;
+            }
+
+            // Environment-variable segment toggles: when a segment is hidden via
+            // an env var, render it as empty content (rather than skipping the
+            // entry) so it keeps its array position. The downstream
+            // separator-collapse logic in renderStatusLine treats empty content
+            // as "no content before/after" and drops the adjacent separator,
+            // leaving no dangling ` | `.
+            if (isWidgetHiddenByEnv(widget)) {
+                preRenderedLine.push({
+                    content: '',
+                    plainLength: 0,
+                    widget
+                });
                 continue;
             }
 

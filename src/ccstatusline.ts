@@ -35,6 +35,7 @@ import {
     preRenderAllWidgets,
     renderStatusLine
 } from './utils/renderer';
+import { isStatuslineDisabled } from './utils/segment-toggles';
 import { advanceGlobalSeparatorIndex } from './utils/separator-index';
 import { getSkillsMetrics } from './utils/skills';
 import {
@@ -91,6 +92,13 @@ async function ensureWindowsUtf8CodePage() {
 }
 
 async function renderMultipleLines(data: StatusJSON) {
+    // Master env toggle: when CCSTATUSLINE_DISABLE is enabled, render nothing.
+    // Highest-priority short-circuit — runs before any settings load or metric
+    // collection so the statusline is fully and cheaply suppressed.
+    if (isStatuslineDisabled()) {
+        return;
+    }
+
     const settings = await loadSettings();
 
     // Set global chalk level based on settings
