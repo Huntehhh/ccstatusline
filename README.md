@@ -34,6 +34,7 @@
 
 - [Recent Updates](#-recent-updates)
 - [Features](#-features)
+- [TrueMemory / segment toggles](#-truememory--segment-toggles)
 - [Localizations](#-localizations)
 - [Quick Start](#-quick-start)
 - [Windows Support](docs/WINDOWS.md)
@@ -228,6 +229,55 @@
 - **🔧 Flexible Configuration** - Supports custom Claude Code config directory via `CLAUDE_CONFIG_DIR` environment variable
 - **📏 Smart Width Detection** - Automatically adapts to terminal width with flex separators
 - **⚡ Zero Config** - Sensible defaults that work out of the box
+
+<br />
+
+## 🔌 TrueMemory / segment toggles
+
+Turn the whole status line — or individual segments — on and off with **environment variables**, without editing `settings.json`. Every toggle is **OFF by default**: with none of these variables set, the output is byte-identical to your configured `settings.json`, so nothing changes for existing users. The variables are read at **render time**, so you can flip them per shell, per project (`.envrc`), or per Claude Code launch.
+
+A toggle counts as *enabled* when its value, case-insensitively and trimmed, is one of `1`, `true`, `on`, or `yes`. Anything else (including `0`, `false`, empty, or unset) leaves the toggle OFF.
+
+When a segment is hidden, its adjacent separator is dropped too — the line never shows a dangling `Model: x |  | branch` or a leading/trailing ` | `.
+
+### Variables
+
+| Environment variable | Effect | Applies to segment type(s) |
+| --- | --- | --- |
+| `CCSTATUSLINE_DISABLE` | **Master off.** Renders nothing (empty output, exit 0). Highest-priority short-circuit — evaluated before any settings load. | *(whole status line)* |
+| `CCSTATUSLINE_HIDE_MODEL` | Hides the model segment (e.g. `Model: Opus 4.7`). | `model` |
+| `CCSTATUSLINE_HIDE_CONTEXT` | Hides the context / token-usage segment (e.g. `Ctx: 587.7k`). | `context-length`, `context-percentage`, `context-percentage-usable` |
+| `CCSTATUSLINE_HIDE_GIT_BRANCH` | Hides the git branch segment (e.g. `⎇ main`). | `git-branch` |
+| `CCSTATUSLINE_HIDE_CUSTOM` | Hides **all** custom-command segments at once. | every `custom-command` |
+| `CCSTATUSLINE_HIDE_SEGMENT_<id>` | Hides **one specific** segment whose `id` matches `<id>` (e.g. `CCSTATUSLINE_HIDE_SEGMENT_9`). Works for any segment type, not just custom commands. This is the general, clean mechanism. | the segment with that `id` |
+
+> The segment `id` is the `"id"` field of each entry under `lines` in your `settings.json`. For example, a custom-command segment configured as `{"id":"9","type":"custom-command","commandPath":"..."}` is hidden by `CCSTATUSLINE_HIDE_SEGMENT_9=1`.
+
+### Examples
+
+```bash
+# Hide the git branch for this shell only
+export CCSTATUSLINE_HIDE_GIT_BRANCH=1
+
+# Hide a specific custom-command segment (id "9") without touching settings.json
+export CCSTATUSLINE_HIDE_SEGMENT_9=1
+
+# Turn the whole status line off (renders nothing)
+export CCSTATUSLINE_DISABLE=1
+```
+
+```powershell
+# PowerShell equivalents
+$env:CCSTATUSLINE_HIDE_GIT_BRANCH = '1'
+$env:CCSTATUSLINE_HIDE_SEGMENT_9  = '1'
+$env:CCSTATUSLINE_DISABLE         = '1'
+```
+
+### Notes
+
+- **Model display vs. raw value.** The `model` segment has a single display value (e.g. `Opus 4.7`); its only built-in nuance is the `rawValue` toggle in the TUI, which strips the `Model: ` label prefix — it is **not** a separate "model name" vs. "opus" value. There is therefore exactly one model toggle, `CCSTATUSLINE_HIDE_MODEL`, which hides the segment entirely. If you want the bare value (`Opus 4.7` instead of `Model: Opus 4.7`) rather than hiding it, use the segment's raw-value option in the TUI.
+- **Context scope.** `CCSTATUSLINE_HIDE_CONTEXT` covers the current-usage readouts (`context-length` and the percentage variants). It intentionally does **not** hide `context-window` (total model window size) or `context-bar`, which are conceptually different widgets.
+- **Additive & harmless.** These toggles are purely additive — when unset, behavior is unchanged — and require no schema migration, so they are safe to carry on top of any configuration.
 
 <br />
 
